@@ -1325,6 +1325,7 @@ class ModelEagle(nn.Module):
     def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
         super().__init__()
 
+        self.accept_all = False
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1581,7 +1582,7 @@ class ModelEagle(nn.Module):
 
     
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor,lpfrog_layer=None):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
 
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
@@ -1873,6 +1874,8 @@ class ModelEagle(nn.Module):
         #总树topk
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
+        if self.accept_all:
+            total_tokens = scores_list.shape[-1]
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values

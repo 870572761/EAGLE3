@@ -114,6 +114,7 @@ def get_model_answers(
         # load_in_8bit=True,
         device_map="auto"
     )
+    model.generate_type = "kl"
 
     tokenizer = model.get_tokenizer()
 

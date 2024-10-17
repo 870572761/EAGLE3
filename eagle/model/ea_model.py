@@ -193,6 +193,8 @@ class EaModel_lpf(nn.Module):
                 times.append((end_time - start_time) / x[i])
             total_token=cans[times.index(min(times))]
             model.ea_layer.total_tokens=total_token-1
+        elif total_token==-2:
+            model.ea_layer.accept_all = True
 
 
 
@@ -314,8 +316,7 @@ class EaModel_lpf(nn.Module):
                 current_length_data,
                 self,
                 hidden_state_new,
-                sample_p,
-                self.lpfrog_layer
+                sample_p
             )
 
             if is_llama3:
