@@ -1320,7 +1320,6 @@ class Model_forward_lpfrog(nn.Module):
         acc = [correct[i] / total[i] for i in range(len(correct))]
         return acc
 
-
 class ModelEagle(nn.Module):
     def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
         super().__init__()
