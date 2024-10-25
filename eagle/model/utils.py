@@ -248,6 +248,12 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
     if model.generate_type == "kl":
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate_kl(
             hidden_states, input_ids, model.base_model.lm_head,logits_processor, model.lpfrog_layer)
+    elif model.generate_type == "lpfeagle":
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate_lpfeagle(
+            hidden_states, input_ids, model.base_model.lm_head,logits_processor, model.lpfrog_layer)
+    elif model.generate_type == "topmatch":
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate_topmatch(
+            hidden_states, input_ids, model.base_model.lm_head,logits_processor, model.lpfrog_layer)
     else:
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(
             hidden_states, input_ids, model.base_model.lm_head,logits_processor)
@@ -323,9 +329,6 @@ def tree_decoding(
 
     logits = tree_logits[0, retrieve_indices]
     return logits, hidden_state, outputs
-
-
-
 
 
 def evaluate_posterior(
@@ -458,6 +461,16 @@ def update_inference_inputs(
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
     if model.generate_type == "kl":
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate_kl(accept_hidden_state_new,
+                                                input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                                head=model.base_model.lm_head,logits_processor=logits_processor,
+                                                lpfrog_layer=model.lpfrog_layer)
+    elif model.generate_type == "lpfeagle":
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate_lpfeagle(accept_hidden_state_new,
+                                                input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                                head=model.base_model.lm_head,logits_processor=logits_processor,
+                                                lpfrog_layer=model.lpfrog_layer)
+    elif model.generate_type == "topmatch":
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate_topmatch(accept_hidden_state_new,
                                                 input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
                                                 head=model.base_model.lm_head,logits_processor=logits_processor,
                                                 lpfrog_layer=model.lpfrog_layer)

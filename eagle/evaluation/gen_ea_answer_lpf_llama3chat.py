@@ -114,7 +114,7 @@ def get_model_answers(
         # load_in_8bit=True,
         device_map="auto"
     )
-    model.generate_type = "kl"
+    model.generate_type = args.method
 
     tokenizer = model.get_tokenizer()
 
@@ -410,6 +410,12 @@ if __name__ == "__main__":
         "--tree-choices",
         type=str,
         default="mc_sim_7b_63",
+    )
+    
+    parser.add_argument(
+        "--method",
+        type=str,
+        default=None,
     )
 
     args = parser.parse_args()

@@ -1009,9 +1009,6 @@ class Model_forward_lpfrog(nn.Module):
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
-
-        #lpfrog
-        position_ids += 1
         
         #position_ids=position_ids//4
         if attention_mask is None:
@@ -1371,9 +1368,15 @@ class ModelEagle(nn.Module):
 
     def init_tree(self):
         self.tree_mask_init = torch.eye(self.top_k*2, device=self.embed_tokens.weight.device)[None, None]
+        self.tree_mask_init0 = torch.eye(self.top_k, device=self.embed_tokens.weight.device)[None, None]
         self.position_ids = torch.zeros(self.top_k*2, device=self.embed_tokens.weight.device, dtype=torch.long)
+        self.position_ids0 = torch.zeros(self.top_k, device=self.embed_tokens.weight.device, dtype=torch.long)
         self.tree_mask_init = self.tree_mask_init.to(self.embed_tokens.weight.device)
+        self.tree_mask_init0 = self.tree_mask_init0.to(self.embed_tokens.weight.device)
 
+    def padding4tree_mask(self, H):
+        padding = torch.eye(H, device=self.embed_tokens.weight.device)[None, None]
+        return padding.to(self.embed_tokens.weight.device)
 
     def reset(self):
         self.tree_mask = None
@@ -1808,8 +1811,9 @@ class ModelEagle(nn.Module):
             position_ids = len_posi + self.position_ids #位置更新
             out_hidden_norm, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
                                                position_ids=position_ids, use_cache=True)
+            position_ids_lpf = position_ids + 1
             out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(input_hidden, input_ids=input_ids, past_key_values=past_key_values_lpf,
-                                               position_ids=position_ids, use_cache=True)
+                                               position_ids=position_ids_lpf, use_cache=True)
             #预处理阶段
             last_normheadout = head(out_hidden_norm[0])
             last_leapfrogheadout = head(out_hidden_lpfrog[0])
@@ -1973,15 +1977,14 @@ class ModelEagle(nn.Module):
                                                past_key_values=self.stable_kv, use_cache=True)
         else:
             out_hidden_norm, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+        self.stable_kv = past_key_values
         #lpfrog
         if hasattr(self, "stable_kv_lpf") and self.stable_kv_lpf is not None:
             kv_len_lpf = self.stable_kv_lpf[0][0].shape[2]
             out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(hidden_states, input_ids=input_ids[:, kv_len_lpf:],
-                                               past_key_values=self.stable_kv, use_cache=True)
+                                               past_key_values=self.stable_kv_lpf, use_cache=True)
         else:
             out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(hidden_states, input_ids=input_ids, use_cache=True)
-        
-        self.stable_kv = past_key_values
         self.stable_kv_lpf = past_key_values_lpf
         #listize
         # last_hidden_list = [out_hidden[:, -1] for out_hidden in out_hidden_list]
@@ -2018,9 +2021,9 @@ class ModelEagle(nn.Module):
         for forward_count in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids #位置更新
-            out_hidden_norm, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-                                               position_ids=position_ids, use_cache=True)
             out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                                               position_ids=position_ids, use_cache=True)
+            out_hidden_norm, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
                                                position_ids=position_ids, use_cache=True)
             #预处理阶段
             last_normheadout = head(out_hidden_norm[0])
@@ -2154,28 +2157,15 @@ class ModelEagle(nn.Module):
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 
-
-    def top_match(
-        self, last_norm_p, predict_p,
-        scores,
-    ):
-        top_k = self.top_k
-        #分布取topk
-        top_norm = torch.topk(last_norm_p, top_k, dim=-1)
-        topk_norm_index, topk_norm_p = top_norm.indices, top_norm.values
-        norm_scores = topk_norm_p + scores[:, None]
-        
-        topk_cs = torch.topk(norm_scores.view(-1), top_k, dim=-1)
-        topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
-        #得到topk的token
-        topk_cs_token = topk_norm_index.view(-1)[topk_cs_index]
-        #chose topk, no matter which predict
-        top_predict = torch.topk(predict_p.view(-1), top_k, dim=-1)
-        top_predict_index, _ = top_predict.indices, top_predict.values
-        #检索now_norm中是否有token在predict里面
-        mask = torch.isin(topk_cs_token, top_predict_index)
-        index = torch.nonzero(mask).view(-1)
-        return index, norm_scores, topk_cs_p, topk_cs_index, topk_norm_index
+    def merge_treemask(self, H, tree_mask, tree_mask_new):
+        zero_matrix = torch.zeros((1, 1, H, H))
+        if tree_mask.shape[-2] + tree_mask_new.shape[-2] != H or tree_mask_new.shape[-1] != H:
+            raise ValueError(
+                f"Sth wrong so that the matrix is wrong and it is not H*H, tree_mask is {tree_mask.shape}, tree_mask_new is {tree_mask_new.shape}."
+            )
+        zero_matrix[:,:,:tree_mask.shape[-2], :tree_mask.shape[-1]] = tree_mask
+        zero_matrix[:,:,tree_mask.shape[-2]:,:] = tree_mask_new
+        return zero_matrix.to(tree_mask.device)
 
     @torch.no_grad()
     def topK_genrate_topmatch(self, hidden_states, input_ids, head, logits_processor, lpfrog_layer):
@@ -2206,117 +2196,265 @@ class ModelEagle(nn.Module):
         else:
             out_hidden_norm, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
         #lpfrog
-        if hasattr(self, "stable_kv_lpf") and self.stable_kv_lpf is not None:
-            kv_len_lpf = self.stable_kv_lpf[0][0].shape[2]
+        if hasattr(self, "stable_kv") and self.stable_kv is not None:
+            kv_len_lpf = self.stable_kv[0][0].shape[2]
             out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(hidden_states, input_ids=input_ids[:, kv_len_lpf:],
                                                past_key_values=self.stable_kv, use_cache=True)
         else:
             out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(hidden_states, input_ids=input_ids, use_cache=True)
         
         self.stable_kv = past_key_values
-        self.stable_kv_lpf = past_key_values_lpf
-        #listize
-        # last_hidden_list = [out_hidden[:, -1] for out_hidden in out_hidden_list]
         last_hidden = out_hidden_norm[:, -1]
         last_headout = head(last_hidden)
         last_p = self.logsoftmax(last_headout)
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values#这里是选取点#[1,3]
-        scores = topk_p[0]#parents scores
-        scores_list.append(scores[None])
+        parents_now_scores = topk_p[0]#parents scores
+        
+        scores_list.append(parents_now_scores[None])
         ss_token.append(topk_index)
-        parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
+        parents_list.append(torch.zeros(1, dtype=torch.long, device=parents_now_scores.device))
         #==========================
         #处理lpf层
         last_hidden_lpfrog = out_hidden_lpfrog[:, -1]
         last_headout_lpfrog = head(last_hidden_lpfrog)
         last_p_lpfrog = self.logsoftmax(last_headout_lpfrog)
-        predict_p = last_p_lpfrog
         #==========================
         #as eagle
-        top_lpfrog = torch.topk(predict_p, top_k, dim=-1)
-        topk_index_lpfrog, _ = top_lpfrog.indices, top_lpfrog.values
+        top_lpfrog = torch.topk(last_p_lpfrog, top_k, dim=-1)
+        topk_index_lpfrog, topk_p_lpfrog = top_lpfrog.indices, top_lpfrog.values
+        parents_future_scores = topk_p_lpfrog[0]
 
         input_ids = torch.cat((topk_index,topk_index_lpfrog),dim=-1)
+        predict_token = topk_index_lpfrog
+        
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
         input_hidden_lpfrog = last_hidden_lpfrog[None].repeat(1, top_k, 1)
         input_hidden = torch.cat((input_hidden,input_hidden_lpfrog),dim=1)
         
         tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
-        base_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
-        i = 0
+        topk_pa_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
+        
+        layer_pa_num = 0
+        position_ids_sum = None
         #===========LLM推理结束
         for forward_count in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids #位置更新
-            out_hidden_norm, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-                                               position_ids=position_ids, use_cache=True)
+            if position_ids_sum is None:
+                position_ids_sum = position_ids
+            else:
+                position_ids_sum = torch.cat((position_ids_sum, position_ids), dim=-1)
+            out_hidden_norm = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                                               position_ids=position_ids_sum, use_cache=False)
+            position_ids_sum_lpf = position_ids_sum + 1#bug
+            out_hidden_lpfrog = lpfrog_layer(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                                               position_ids=position_ids_sum_lpf, use_cache=False)
+            out_hidden_norm, out_hidden_lpfrog = out_hidden_norm[:, -top_k*2:], out_hidden_lpfrog[:, -top_k*2:]
             #预处理阶段
             last_normheadout = head(out_hidden_norm[0])
             last_norm_p = self.logsoftmax(last_normheadout)#torch.Size([3, 32000])
-            #切成四份
+            last_leapfrogheadout = head(out_hidden_lpfrog[0])
+            last_leapfrog_p = self.logsoftmax(last_leapfrogheadout)
+            #get 4 p
             last_now_norm_p = last_norm_p[:top_k,:]
             last_future_norm_p = last_norm_p[top_k:,:]
-            #==========================输入上次节点在每行的相对索引topk_cs_index作为父节点
-            parents = self.make_parents(i, topk_cs_index)
+            last_now_leapfrog_p = last_leapfrog_p[:top_k,:]
+            last_future_leapfrog_p = last_leapfrog_p[top_k:,:]
+            #get 4 hidden
+            out_hidden_norm_now = out_hidden_norm[:, :top_k]
+            out_hidden_future_norm = out_hidden_norm[:, top_k:]
+            out_hidden_lpf_now = out_hidden_lpfrog[:, :top_k]
+            out_hidden_future_lpf = out_hidden_lpfrog[:, top_k:]
+            
+            #==========================just need to know the parents
+            parents = self.make_parents(layer_pa_num, topk_pa_index)
             parents_list.append(parents)
-            #第一层选择
-            idx_norm, now_norm_scores, topk_cs_p, topk_cs_index, topk_n_norm_index = self.top_match(
-                last_now_norm_p, predict_p, scores)
-            #第一层选择
+            #1.1 chose for now norm
+            top_now_norm = torch.topk(last_now_norm_p, top_k, dim=-1)
+            topk_now_norm_index, topk_now_norm_p = top_now_norm.indices, top_now_norm.values
+            
+            #1.2 select now norm as eagle:scores and token
+            now_norm_scores = topk_now_norm_p + parents_now_scores[:, None]
             scores_list.append(now_norm_scores)
-            ss_token.append(topk_n_norm_index)
-            i += 1
-            #第一层lpfrog
-            out_ids = topk_cs_index // top_k
-            #==========================判断是否要进入第二层
-            #第一层扩展
-            if idx_norm.shape == 0:#匹配失败，没有token在其中，退化为eagle
-                scores = topk_cs_p
-                out_ids = topk_cs_index // top_k
-                input_hidden = out_hidden_norm[:, out_ids]
-                input_ids = topk_n_norm_index.view(-1)[topk_cs_index][None]
-                tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
-                len_posi += 1
-            else:#match successully
-                out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(input_hidden, input_ids=input_ids, past_key_values=past_key_values_lpf,
-                                               position_ids=position_ids, use_cache=True)
-                #1/get match idx to topk_cs_index
-                topk_cs_index = idx_norm[None]
-                #2/topk_cs_index get scores so that become the parents scores
-                scores = now_norm_scores[topk_cs_index]
-                #3/due to chosen those already forword, so get the sub_P and get topk
-                top_future = torch.topk(last_future_norm_p[topk_cs_index], top_k, dim=-1)
-                top_future_token, top_future_p = top_future.indices, top_future.values
-                #4/the topk should be select
-                top_f_cs_score = top_future_p + scores
-                scores_list.append(top_f_cs_score)
-                ss_token.append(top_future_token)
-                #5/You can notice if matching, the topk_cs_index also lpf forward, so match again.
-                #but is match from future_norm_matching
-                # predict_p = 
-                idx_norm, now_norm_scores, topk_cs_p, topk_cs_index, topk_n_norm_index = self.top_match(
-                    last_future_norm_p[topk_cs_index], predict_p, scores)
-                #==========================#第二层选择
+            ss_token.append(topk_now_norm_index)
+            #parents in diffent layer
+            layer_pa_num += 1
+            
+            #first get the topk
+            topk_now_norm_cs = torch.topk(now_norm_scores.view(-1), top_k, dim=-1)
+            topk_now_norm_cs_index, topk_now_norm_cs_p = topk_now_norm_cs.indices, topk_now_norm_cs.values
+            topk_now_norm_token = topk_now_norm_index.view(-1)[topk_now_norm_cs_index][None]
+            
+            #1.4 match with the the token of predict_p in the topk of now_norm
+            mask_now = torch.isin(topk_now_norm_token, predict_token)
+            mask_future = torch.isin(predict_token, topk_now_norm_token)
+            
+            #delete the lpf token and mask
+            input_ids = input_ids[:, :-top_k]
+            tree_mask = tree_mask[:, :, :-top_k, :-top_k]
+            position_ids_sum = position_ids_sum[:-top_k]
+            input_hidden = input_hidden[:, :-top_k]
+            if not mask_now.any():#matching false
+                #2.1.1 find the select now norm hidden and token
+                #hidden
+                out_now_norm_ids = topk_now_norm_cs_index // top_k
+                input_hidden_norm_now = out_hidden_norm_now[:, out_now_norm_ids]
+                #token & mask
+                input_now_norm_ids = topk_now_norm_index.view(-1)[topk_now_norm_cs_index][None]
+                tree_mask_now_norm_new = tree_mask[:, :, -top_k:][:, :, out_now_norm_ids]
                 
-                #选择将要扩展的点，和eagle一样
-                top_cs_future = torch.topk(top_f_cs_score.view(-1), top_k, dim=-1)
-                top_f, top_fp_score =top_cs_future.indices, top_cs_future.values
-                #选择器分数进行承接
-                scores = top_fp_score
-                out_ids = topk_cs_index // top_k
-                #找到对应的影藏层
-                input_hidden = out_hidden_norm[:,out_ids+top_k]
-                input_ids = top_future_token.view(-1)[topk_cs_index][None]
-                tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
-                out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(input_hidden, input_ids=input_ids, past_key_values=past_key_values_lpf,
-                                               position_ids=position_ids, use_cache=True)
-                last_leapfrogheadout = head(out_hidden_lpfrog[0])
-                last_leapfrog_p = self.logsoftmax(last_leapfrogheadout)
-                last_now_leapfrog_p = last_leapfrog_p[:top_k,:]
-                last_future_leapfrog_p = last_leapfrog_p[top_k:,:]
-                len_posi += 2#推理了俩层,当然加2
+                #3.1.1 find the select now lpf hidden and token, also use eagle topk
+                top_now_lpf = torch.topk(last_now_leapfrog_p, top_k, dim=-1)
+                topk_now_lpf_index, topk_now_lpf_p = top_now_lpf.indices, top_now_lpf.values
+                now_lpf_scores = topk_now_lpf_p + parents_now_scores[:, None]
+                
+                topk_now_lpf_cs = torch.topk(now_lpf_scores.view(-1), top_k, dim=-1)
+                topk_now_lpf_cs_index, topk_now_lpf_cs_p = topk_now_lpf_cs.indices, topk_now_lpf_cs.values
+                
+                #4.1.1 find the select now lpf hidden and token
+                #hidden
+                out_now_lpf_ids = topk_now_lpf_cs_index // top_k
+                input_hidden_lpf_now = out_hidden_lpf_now[:, out_now_lpf_ids]
+                #token & mask
+                input_now_lpf_ids = topk_now_lpf_index.view(-1)[topk_now_lpf_cs_index][None]
+                tree_mask_now_lpf_new = tree_mask[:, :, -top_k:][:, :, out_now_lpf_ids]
+                
+                #5.1.1 merge:hidden, token, mask
+                input_hidden = torch.cat((input_hidden,input_hidden_norm_now),dim=1)
+                input_hidden = torch.cat((input_hidden,input_hidden_lpf_now),dim=1)
+                # input_hidden = torch.cat((input_hidden_norm_now,input_hidden_lpf_now),dim=1)
+                input_ids_new = torch.cat((input_now_norm_ids,input_now_lpf_ids),dim=-1)
+                input_ids = torch.cat((input_ids,input_ids_new),dim=-1)
+                # input_ids = torch.cat((input_now_norm_ids,input_now_lpf_ids),dim=-1)
+                tree_mask_new = torch.cat((tree_mask_now_norm_new, tree_mask_now_lpf_new), dim=2)
+                tree_mask_new = torch.cat((tree_mask_new, self.tree_mask_init), dim=3)
+                tree_mask = self.merge_treemask(input_ids.shape[-1], tree_mask, tree_mask_new)
+                
+                #6.1.1 update pa scores and token
+                parents_now_scores = topk_now_norm_cs_p
+                topk_pa_index = topk_now_norm_cs_index
+                
+                #6.1.1 update predict scores and token
+                parents_future_scores = topk_now_lpf_cs_p
+                predict_token = input_now_lpf_ids
+                
+                #6.1.2 position add 1
+                len_posi += 1
+            else:#match successully, we dont need now_norm_mask and
+                predict_token, topk_now_norm_token = predict_token[mask_future], topk_now_norm_token[mask_now]
+                last_future_norm_p, last_future_leapfrog_p = last_future_norm_p[mask_future[0]], last_future_leapfrog_p[mask_future[0]]
+                out_hidden_future_norm, out_hidden_future_lpf = out_hidden_future_norm[:, mask_future[0]], out_hidden_future_lpf[:, mask_future[0]]
+                
+                #2.2.0 get the reshape the p index
+                sort_predict_token = torch.sort(predict_token)
+                sort_predict_token_v, sort_predict_token_i = sort_predict_token.values, sort_predict_token.indices
+                idx_norm_now = torch.searchsorted(sort_predict_token_v, topk_now_norm_token, right = False)
+                new_sort_idx_future = sort_predict_token_i[idx_norm_now]
+                
+                #2.2.1 chose the match one in norm, and update the parents
+                topk_pa_index = topk_now_norm_cs_index[mask_now[0]]
+                #due to kv, so mask should update, zero pad so the now_lpf could be seen
+                out_put_pa_id = topk_pa_index // top_k
+                
+                #update token to input and hidden
+                input_hidden_norm_now = out_hidden_norm_now[:, out_put_pa_id]
+                input_hidden = torch.cat((input_hidden, input_hidden_norm_now),dim=1)
+                input_ids = torch.cat((input_ids, topk_now_norm_token[None]), dim=-1)
+                
+                #same mask is for track right. due to later have different number of token in forward.
+                # sub_tree_mask = torch.cat((tree_mask[:, :, out_put_pa_id], tree_mask[:, :, out_put_pa_id]), dim=2)
+                sub_H = topk_pa_index.shape[-1]
+                tree_mask_sub = tree_mask[:,:, -top_k:]#must from top_k
+                tree_mask_sub_cs = tree_mask_sub[:, :, out_put_pa_id]
+                tree_mask_new = torch.cat((tree_mask_sub_cs, self.padding4tree_mask(sub_H)), dim=3)
+                tree_mask = self.merge_treemask(input_ids.shape[-1], tree_mask, tree_mask_new)
+                
+                #update position & mask
+                len_posi += 1
+                position_ids = len_posi + self.position_ids #位置更新
+                position_ids_sum = torch.cat((position_ids_sum, position_ids[:sub_H]), dim=-1)
+                
+                self.tree_mask = tree_mask
+                tree_mask_sub = tree_mask[:,:, -sub_H:]#must from sub_H rather than top_k
+                
+                parents = self.make_parents(layer_pa_num, topk_pa_index)
+                parents_list.append(parents)
+                
+                #2.2.2 update the pa scores for future norm
+                parents_future_scores = topk_now_norm_cs_p[mask_now[0]]
+                
+                #3.2.1 find chosen future norm
+                last_future_norm_sort_p = last_future_norm_p[new_sort_idx_future, :]
+                last_future_lpf_sort_p = last_future_leapfrog_p[new_sort_idx_future, :]
+                out_hidden_future_norm_sort = out_hidden_future_norm[:,new_sort_idx_future,:]
+                out_hidden_future_lpf_sort = out_hidden_future_lpf[:,new_sort_idx_future,:]
+                
+                #4.2.1 eagle forward for future_norm!!!!!!!!!!!!!!!
+                top_future_norm_sort = torch.topk(last_future_norm_sort_p, top_k, dim=-1)
+                topk_future_norm_sort_index, topk_future_norm_sort_p = top_future_norm_sort.indices, top_future_norm_sort.values
+                
+                #4.2.2 select future norm as eagle:scores and token
+                ss_token.append(topk_future_norm_sort_index)
+                cu_future_norm_sort_scores = topk_future_norm_sort_p + parents_future_scores[:, None]
+                scores_list.append(cu_future_norm_sort_scores)
+                #parents in diffent layer
+                
+                layer_pa_num += 1
+                
+                #eagle top_k:cu_future_norm_sort_scores=[sub_H,top_k]
+                topk_future_norm_sort_cs = torch.topk(cu_future_norm_sort_scores.view(-1), top_k, dim=-1)
+                topk_future_norm_sort_cs_index, topk_future_norm_sort_cs_p = topk_future_norm_sort_cs.indices, topk_future_norm_sort_cs.values
+                
+                #5.1 find the select future_norm hidden and token
+                #hidden
+                out_future_norm_sort_ids = topk_future_norm_sort_cs_index // top_k# it will not over sub_H
+                #due to change position so you need to sort again
+                input_hidden_future_norm_sort = out_hidden_future_norm_sort[:, out_future_norm_sort_ids]
+                #token & mask
+                input_future_norm_ids = topk_future_norm_sort_index.view(-1)[topk_future_norm_sort_cs_index][None]
+                #so the mask need to be sort, they all consider from norm_now
+                tree_mask_future_norm = tree_mask_sub[:, :, out_future_norm_sort_ids]
+                
+                #6.1 find the select future_lpf hidden and token, also use eagle topk
+                top_future_lpf_sort = torch.topk(last_future_lpf_sort_p, top_k, dim=-1)
+                topk_future_lpf_index, topk_future_lpf_p = top_future_lpf_sort.indices, top_future_lpf_sort.values
+                future_lpf_scores = topk_future_lpf_p + parents_future_scores[:, None]
+                
+                topk_future_lpf_cs = torch.topk(future_lpf_scores.view(-1), top_k, dim=-1)
+                topk_future_lpf_cs_index, topk_future_lpf_cs_p = topk_future_lpf_cs.indices, topk_future_lpf_cs.values
+                
+                #7.1 find the select future lpf hidden and token
+                #hidden
+                out_future_lpf_ids = topk_future_lpf_cs_index // top_k
+                input_hidden_lpf_future_sort = out_hidden_future_lpf_sort[:, out_future_lpf_ids]
+                #token & mask
+                input_future_lpf_ids = topk_future_lpf_index.view(-1)[topk_future_lpf_cs_index][None]
+                #so the mask need to be sort, they all consider from norm_now
+                tree_mask_future_lpf = tree_mask_sub[:, :, out_future_lpf_ids]
+                
+                #8.1 merge:hidden, token, mask
+                input_hidden = torch.cat((input_hidden, input_hidden_future_norm_sort),dim=1)
+                input_hidden = torch.cat((input_hidden, input_hidden_lpf_future_sort),dim=1)
+                # input_hidden = torch.cat((input_hidden_future_norm_sort, input_hidden_lpf_future_sort),dim=1)
+                input_ids = torch.cat((input_ids, input_future_norm_ids),dim=-1)
+                input_ids = torch.cat((input_ids, input_future_lpf_ids),dim=-1)
+                
+                # input_ids = torch.cat((input_future_norm_ids, input_future_lpf_ids),dim=-1)
+                tree_mask_sub_cs = torch.cat((tree_mask_future_norm, tree_mask_future_lpf), dim=2)
+                tree_mask_new = torch.cat((tree_mask_sub_cs, self.tree_mask_init), dim=3)
+                tree_mask = self.merge_treemask(input_ids.shape[-1], tree_mask, tree_mask_new)
+                
+                #9.1 update pa scores and token
+                parents_now_scores = topk_future_norm_sort_cs_p
+                topk_pa_index = topk_future_norm_sort_cs_index
+                
+                #10.1 update predict scores and token
+                parents_future_scores = topk_future_lpf_cs_p
+                predict_token = input_future_lpf_ids
+                
+                #11.1 position add 1
+                len_posi += 1
 
         #总树topk
         scores_list = torch.cat(scores_list, dim=0).view(-1)
