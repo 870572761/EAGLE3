@@ -115,6 +115,7 @@ def get_model_answers(
         device_map="auto"
     )
     model.generate_type = args.method
+    model.ea_layer.method = args.method
 
     tokenizer = model.get_tokenizer()
 

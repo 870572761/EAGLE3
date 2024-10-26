@@ -170,8 +170,6 @@ class EaModel_lpf(nn.Module):
             lpf_layer_state_dict
         )
 
-
-
         if total_token==-1:
             device = model.base_model.model.layers[0].self_attn.q_proj.weight.device
             cans=[40,48,50,56,60]
@@ -195,10 +193,7 @@ class EaModel_lpf(nn.Module):
             model.ea_layer.total_tokens=total_token-1
         elif total_token==-2:
             model.ea_layer.accept_all = True
-
-
-
-
+        
         return model
 
     def forward(

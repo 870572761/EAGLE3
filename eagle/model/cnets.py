@@ -748,9 +748,6 @@ class Model(nn.Module):
             #     break
 
         # del parents_list,scores_list,ss_token
-        # return draft_tokens, mask_index,tree_mask,tree_position_ids
-
-        # with Timer("post"):
 
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
@@ -773,20 +770,6 @@ class Model(nn.Module):
         for i in range(total_tokens):
             tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
 
-        # with Timer("mask1"):
-        #     tree_mask0 = [[False for _ in range(total_tokens + 1)] for _ in range(total_tokens + 1)]
-        #     tree_mask0[0][0] = True
-        #     for i in range(total_tokens):
-        #         #tree_mask0[i + 1][0]=True
-        #         tree_mask0[i + 1][i + 1] = True
-        #         p=mask_index_list[i]
-        #         tree_mask0[i + 1][p] = True
-        #         while p:
-        #             p=mask_index_list[p-1]
-        #             tree_mask0[i + 1][p] = True
-        #     tree_mask0 = torch.tensor(tree_mask0, dtype=torch.bool)
-        #
-        # print(tree_mask0.equal(tree_mask))
         tree_position_ids = torch.sum(tree_mask, dim=1) - 1
 
         tree_mask = tree_mask.float()[None, None]
@@ -1322,6 +1305,7 @@ class ModelEagle(nn.Module):
         super().__init__()
 
         self.accept_all = False
+        self.method = None
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1364,7 +1348,6 @@ class ModelEagle(nn.Module):
         self.tree_mask_init = torch.eye(self.top_k, device=self.embed_tokens.weight.device)[None, None]
         self.position_ids = torch.zeros(self.top_k, device=self.embed_tokens.weight.device, dtype=torch.long)
         self.tree_mask_init = self.tree_mask_init.to(self.embed_tokens.weight.device)
-
 
     def init_tree(self):
         self.tree_mask_init = torch.eye(self.top_k*2, device=self.embed_tokens.weight.device)[None, None]
@@ -1574,15 +1557,17 @@ class ModelEagle(nn.Module):
         return scores_list, ss_token, midx, norm_scores, topk_norm_index
 
     @torch.no_grad()
-    def make_parents(self, i, topk_cs_index):
+    def make_parents(self, i, topk_cs_index, last_index=None):
         top_k = self.top_k
-        bias1 = top_k if i > 0 else 0
-        bias2 = max(0, i - 1)
-        bias = 1 + top_k ** 2 * bias2 + bias1
+        if self.method != "topmatch": 
+            bias1 = top_k if i > 0 else 0
+            bias2 = max(0, i - 1)
+            bias = 1 + top_k ** 2 * bias2 + bias1
+        else:
+            bias = last_index
         parents = (topk_cs_index + bias)
         return parents
 
-    
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
 
@@ -1765,17 +1750,15 @@ class ModelEagle(nn.Module):
         else:
             out_hidden_norm, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
         #lpfrog
-        if hasattr(self, "stable_kv_lpf") and self.stable_kv_lpf is not None:
-            kv_len_lpf = self.stable_kv_lpf[0][0].shape[2]
+        if hasattr(self, "stable_kv") and self.stable_kv is not None:
+            kv_len_lpf = self.stable_kv[0][0].shape[2]
             out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(hidden_states, input_ids=input_ids[:, kv_len_lpf:],
                                                past_key_values=self.stable_kv, use_cache=True)
         else:
             out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(hidden_states, input_ids=input_ids, use_cache=True)
         
         self.stable_kv = past_key_values
-        self.stable_kv_lpf = past_key_values_lpf
         #listize
-        # last_hidden_list = [out_hidden[:, -1] for out_hidden in out_hidden_list]
         last_hidden = out_hidden_norm[:, -1]
         last_headout = head(last_hidden)
         last_p = self.logsoftmax(last_headout)
@@ -1804,16 +1787,25 @@ class ModelEagle(nn.Module):
         tree_mask = self.tree_mask_init
         topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
         base_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
-        i = 0
+        layer_pa_num = 0
+        position_ids_sum = None
+        #list tree index
+        tree_first_index = 1
         #===========LLM推理结束
         for forward_count in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids #位置更新
-            out_hidden_norm, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-                                               position_ids=position_ids, use_cache=True)
+            if position_ids_sum is None:
+                position_ids_sum = position_ids
+            else:
+                position_ids_sum = torch.cat((position_ids_sum, position_ids), dim=-1)
+            out_hidden_norm = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                                               position_ids=position_ids, use_cache=False)
             position_ids_lpf = position_ids + 1
-            out_hidden_lpfrog, past_key_values_lpf = lpfrog_layer(input_hidden, input_ids=input_ids, past_key_values=past_key_values_lpf,
-                                               position_ids=position_ids_lpf, use_cache=True)
+            out_hidden_lpfrog = lpfrog_layer(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                                               position_ids=position_ids_lpf, use_cache=False)
+            #just need new token
+            out_hidden_norm, out_hidden_lpfrog = out_hidden_norm[:, -top_k*2:], out_hidden_lpfrog[:, -top_k*2:]
             #预处理阶段
             last_normheadout = head(out_hidden_norm[0])
             last_leapfrogheadout = head(out_hidden_lpfrog[0])
@@ -1824,13 +1816,20 @@ class ModelEagle(nn.Module):
             last_future_norm_p = last_norm_p[top_k:,:]
             last_now_leapfrog_p = last_leapfrog_p[:top_k,:]
             last_future_leapfrog_p = last_leapfrog_p[top_k:,:]
-            #==========================输入上次节点在每行的相对索引topk_cs_index作为父节点
-            parents = self.make_parents(i, topk_cs_index)
+            #get 4 hidden
+            out_hidden_norm_now = out_hidden_norm[:, :top_k]
+            out_hidden_future_norm = out_hidden_norm[:, top_k:]
+            out_hidden_lpf_now = out_hidden_lpfrog[:, :top_k]
+            out_hidden_future_lpf = out_hidden_lpfrog[:, top_k:]
+            
+            #==========================just need to know the parents
+            
+            parents = self.make_parents(layer_pa_num, topk_cs_index)
             parents_list.append(parents)
             #第一层
             scores_list, ss_token, idx_norm, now_norm_scores,_= self.compute_kl_and_update_scores(
                 last_now_norm_p, predict_p, scores, scores_list, ss_token)
-            i += 1
+            layer_pa_num += 1
             #==========================对第二层的预处理
             #将匹配的那跳步预测作为下次对比项
             predict_p = last_now_leapfrog_p[idx_norm]
@@ -1843,9 +1842,9 @@ class ModelEagle(nn.Module):
             scores_list, ss_token, idx_lpfrog, future_norm_scores,topk_future_norm_index= self.compute_kl_and_update_scores(
                 last_future_norm_p, predict_p, scores, scores_list, ss_token)
             #==========================输入上次节点在每行的相对索引topk_cs_index作为父节点
-            parents = self.make_parents(i, topk_cs_index)
+            parents = self.make_parents(layer_pa_num, topk_cs_index)
             parents_list.append(parents)
-            i += 1
+            layer_pa_num += 1
             #==========================对第未来层的预处理
             #将匹配的那跳步预测作为下次对比项
             predict_p = last_future_leapfrog_p[idx_lpfrog]
@@ -1947,7 +1946,6 @@ class ModelEagle(nn.Module):
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
-
 
     @torch.no_grad()
     def topK_genrate_lpfeagle(self, hidden_states, input_ids, head, logits_processor, lpfrog_layer):
@@ -2237,6 +2235,8 @@ class ModelEagle(nn.Module):
         
         layer_pa_num = 0
         position_ids_sum = None
+        #list tree index
+        tree_first_index = 1
         #===========LLM推理结束
         for forward_count in range(depth):
             self.tree_mask = tree_mask
@@ -2250,8 +2250,9 @@ class ModelEagle(nn.Module):
             position_ids_sum_lpf = position_ids_sum + 1#bug
             out_hidden_lpfrog = lpfrog_layer(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
                                                position_ids=position_ids_sum_lpf, use_cache=False)
+            #just need new token
             out_hidden_norm, out_hidden_lpfrog = out_hidden_norm[:, -top_k*2:], out_hidden_lpfrog[:, -top_k*2:]
-            #预处理阶段
+            #pre split
             last_normheadout = head(out_hidden_norm[0])
             last_norm_p = self.logsoftmax(last_normheadout)#torch.Size([3, 32000])
             last_leapfrogheadout = head(out_hidden_lpfrog[0])
@@ -2268,7 +2269,8 @@ class ModelEagle(nn.Module):
             out_hidden_future_lpf = out_hidden_lpfrog[:, top_k:]
             
             #==========================just need to know the parents
-            parents = self.make_parents(layer_pa_num, topk_pa_index)
+            
+            parents = self.make_parents(layer_pa_num, topk_pa_index, tree_first_index)
             parents_list.append(parents)
             #1.1 chose for now norm
             top_now_norm = torch.topk(last_now_norm_p, top_k, dim=-1)
@@ -2280,6 +2282,7 @@ class ModelEagle(nn.Module):
             ss_token.append(topk_now_norm_index)
             #parents in diffent layer
             layer_pa_num += 1
+            tree_first_index += ss_token[layer_pa_num-1].view(-1).shape[-1]
             
             #first get the topk
             topk_now_norm_cs = torch.topk(now_norm_scores.view(-1), top_k, dim=-1)
@@ -2378,7 +2381,7 @@ class ModelEagle(nn.Module):
                 self.tree_mask = tree_mask
                 tree_mask_sub = tree_mask[:,:, -sub_H:]#must from sub_H rather than top_k
                 
-                parents = self.make_parents(layer_pa_num, topk_pa_index)
+                parents = self.make_parents(layer_pa_num, topk_pa_index, tree_first_index)
                 parents_list.append(parents)
                 
                 #2.2.2 update the pa scores for future norm
@@ -2401,6 +2404,7 @@ class ModelEagle(nn.Module):
                 #parents in diffent layer
                 
                 layer_pa_num += 1
+                tree_first_index += ss_token[layer_pa_num-1].view(-1).shape[-1]
                 
                 #eagle top_k:cu_future_norm_sort_scores=[sub_H,top_k]
                 topk_future_norm_sort_cs = torch.topk(cu_future_norm_sort_scores.view(-1), top_k, dim=-1)
@@ -2456,20 +2460,26 @@ class ModelEagle(nn.Module):
                 #11.1 position add 1
                 len_posi += 1
 
-        #总树topk
+        #1. you get all scores in list, so flatten them
         scores_list = torch.cat(scores_list, dim=0).view(-1)
+        #2. also do it to the token
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
+        if self.accept_all:
+            total_tokens = scores_list.shape[-1]
+        #3. get top total_token token 
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
+        #4. it is the index of all token. 
         top_scores_index = top_scores.indices
+        #5. sort the index. so you can get a normal index in the tree of sort index.
         top_scores_index = torch.sort(top_scores_index).values
 
-        #如何去做一个draft_tokens, 考虑top_scores_index如何构建
+        #this index is the scores_list index. so get token by index
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
 
-        #树的构建
-
+        #draft_parents is representing token parents
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
+        #find the
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
         # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
         mask_index[draft_parents == 0] = -1
