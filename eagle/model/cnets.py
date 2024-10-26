@@ -1559,7 +1559,7 @@ class ModelEagle(nn.Module):
     @torch.no_grad()
     def make_parents(self, i, topk_cs_index, last_index=None):
         top_k = self.top_k
-        if self.method != "topmatch": 
+        if self.method not in ["topmatch"]: 
             bias1 = top_k if i > 0 else 0
             bias2 = max(0, i - 1)
             bias = 1 + top_k ** 2 * bias2 + bias1
@@ -2537,6 +2537,195 @@ class ModelEagle(nn.Module):
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
+
+    @torch.no_grad()
+    def topK_genrate_reeagle(self, hidden_states, input_ids, head, logits_processor):
+
+        input_ids = input_ids.to(hidden_states.device)
+        total_tokens = self.total_tokens
+        depth = self.depth
+        top_k = self.top_k
+
+        sample_token = input_ids[:, -1]
+
+        scores_list = []
+        parents_list = []
+        ss_token = []
+
+        input_ids = input_ids[:, 1:]
+        input_ids = input_ids.to(hidden_states.device)
+
+        len_posi = input_ids.shape[1]#40
+        self.reset()
+
+        # with Timer("draft many"): normal
+        if hasattr(self, "stable_kv") and self.stable_kv is not None:
+            kv_len = self.stable_kv[0][0].shape[2]
+            out_hidden_norm, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+                                               past_key_values=self.stable_kv, use_cache=True)
+        else:
+            out_hidden_norm, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+        
+        self.stable_kv = past_key_values
+        last_hidden = out_hidden_norm[:, -1]
+        last_headout = head(last_hidden)
+        last_p = self.logsoftmax(last_headout)
+        top = torch.topk(last_p, top_k, dim=-1)
+        topk_index, topk_p = top.indices, top.values#这里是选取点#[1,3]
+        parents_now_scores = topk_p[0]#parents scores
+        
+        scores_list.append(parents_now_scores[None])
+        ss_token.append(topk_index)
+        parents_list.append(torch.zeros(1, dtype=torch.long, device=parents_now_scores.device))
+
+        input_ids = topk_index
+        
+        input_hidden = last_hidden[None].repeat(1, top_k, 1)
+        
+        tree_mask = self.tree_mask_init
+        topk_pa_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
+        
+        layer_pa_num = 0
+        position_ids_sum = None
+        #list tree index
+        tree_first_index = 1
+        #===========LLM推理结束
+        for forward_count in range(depth):
+            self.tree_mask = tree_mask
+            position_ids = len_posi + self.position_ids #位置更新
+            if position_ids_sum is None:
+                position_ids_sum = position_ids
+            else:
+                position_ids_sum = torch.cat((position_ids_sum, position_ids), dim=-1)
+            out_hidden_norm = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                                               position_ids=position_ids_sum, use_cache=False)
+            #just need new token
+            out_hidden_norm = out_hidden_norm[:, -top_k:]
+            #pre split
+            last_normheadout = head(out_hidden_norm[0])
+            last_norm_p = self.logsoftmax(last_normheadout)#torch.Size([3, 32000])
+            #get 4 p
+            last_now_norm_p = last_norm_p[:top_k,:]
+            #get 4 hidden
+            out_hidden_norm_now = out_hidden_norm[:, :top_k]
+            #==========================just need to know the parents
+            
+            parents = self.make_parents(layer_pa_num, topk_pa_index, tree_first_index)
+            parents_list.append(parents)
+            #1.1 chose for now norm
+            top_now_norm = torch.topk(last_now_norm_p, top_k, dim=-1)
+            topk_now_norm_index, topk_now_norm_p = top_now_norm.indices, top_now_norm.values
+            
+            #1.2 select now norm as eagle:scores and token
+            now_norm_scores = topk_now_norm_p + parents_now_scores[:, None]
+            scores_list.append(now_norm_scores)
+            ss_token.append(topk_now_norm_index)
+            #parents in diffent layer
+            layer_pa_num += 1
+            tree_first_index += ss_token[layer_pa_num-1].view(-1).shape[-1]
+            
+            #first get the topk
+            topk_now_norm_cs = torch.topk(now_norm_scores.view(-1), top_k, dim=-1)
+            topk_now_norm_cs_index, topk_now_norm_cs_p = topk_now_norm_cs.indices, topk_now_norm_cs.values
+            
+            #2.1.1 find the select now norm hidden and token
+            #hidden
+            out_now_norm_ids = topk_now_norm_cs_index // top_k
+            input_hidden_norm_now = out_hidden_norm_now[:, out_now_norm_ids]
+            #token & mask
+            input_now_norm_ids = topk_now_norm_index.view(-1)[topk_now_norm_cs_index][None]
+            tree_mask_now_norm_new = tree_mask[:, :, -top_k:][:, :, out_now_norm_ids]
+            
+            #5.1.1 merge:hidden, token, mask
+            input_hidden = torch.cat((input_hidden,input_hidden_norm_now),dim=1)
+            input_ids = torch.cat((input_ids,input_now_norm_ids),dim=-1)
+            tree_mask_new = torch.cat((tree_mask_now_norm_new, self.tree_mask_init), dim=3)
+            tree_mask = self.merge_treemask(input_ids.shape[-1], tree_mask, tree_mask_new)
+            
+            #6.1.1 update pa scores and token
+            parents_now_scores = topk_now_norm_cs_p
+            topk_pa_index = topk_now_norm_cs_index
+            
+            #6.1.2 position add 1
+            len_posi += 1
+        #1. you get all scores in list, so flatten them
+        scores_list = torch.cat(scores_list, dim=0).view(-1)
+        #2. also do it to the token
+        ss_token_list = torch.cat(ss_token, dim=0).view(-1)
+        if self.accept_all:
+            total_tokens = scores_list.shape[-1]
+        #3. get top total_token token 
+        top_scores = torch.topk(scores_list, total_tokens, dim=-1)
+        #4. it is the index of all token. 
+        top_scores_index = top_scores.indices
+        #5. sort the index. so you can get a normal index in the tree of sort index.
+        top_scores_index = torch.sort(top_scores_index).values
+
+        #this index is the scores_list index. so get token by index
+        draft_tokens = ss_token_list[top_scores_index]
+        draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
+
+        #draft_parents is representing token parents
+        draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
+        #find the
+        mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
+        # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
+        mask_index[draft_parents == 0] = -1
+        mask_index = mask_index + 1
+        mask_index_list = mask_index.tolist()
+        # 总mask构建
+        tree_mask = torch.eye(total_tokens + 1).bool()
+        tree_mask[:, 0] = True#根节点都看得见
+        for i in range(total_tokens):
+            tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
+
+        tree_position_ids = torch.sum(tree_mask, dim=1) - 1
+
+        tree_mask = tree_mask.float()[None, None]
+        draft_tokens = draft_tokens[None]
+
+        del parents_list, scores_list, ss_token, ss_token_list, draft_parents
+
+        # with Timer("retrieve"):
+
+        max_depth = torch.max(tree_position_ids) + 1
+        noleaf_index = torch.unique(mask_index).tolist()
+        noleaf_num = len(noleaf_index) - 1
+        leaf_num = total_tokens - noleaf_num
+
+        retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long) - 1#推理链码
+        retrieve_indices = retrieve_indices.tolist()
+
+        rid = 0
+        position_ids_list = tree_position_ids.tolist()#节点的深度
+
+        for i in range(total_tokens + 1):
+            if i not in noleaf_index:
+                cid = i
+                depth = position_ids_list[i]
+                for j in reversed(range(depth + 1)):
+                    retrieve_indices[rid][j] = cid
+                    cid = mask_index_list[cid - 1]
+                rid += 1
+
+        if logits_processor is not None:
+            maxitem = total_tokens + 5
+
+            def custom_sort(lst):
+                # sort_keys=[len(list)]
+                sort_keys = []
+                for i in range(len(lst)):
+                    sort_keys.append(lst[i] if lst[i] >= 0 else maxitem)
+                return sort_keys
+
+            retrieve_indices = sorted(retrieve_indices, key=custom_sort)
+
+        retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
+        del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
+        tree_position_ids = tree_position_ids.to(hidden_states.device)
+
+        return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
+
 
     @torch.no_grad()
     def acc(self, data, head, max_length=5):

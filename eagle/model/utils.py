@@ -254,6 +254,9 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
     elif model.generate_type == "topmatch":
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate_topmatch(
             hidden_states, input_ids, model.base_model.lm_head,logits_processor, model.lpfrog_layer)
+    elif model.generate_type == "reeagle":
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate_reeagle(
+            hidden_states, input_ids, model.base_model.lm_head,logits_processor)
     else:
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(
             hidden_states, input_ids, model.base_model.lm_head,logits_processor)
@@ -474,6 +477,10 @@ def update_inference_inputs(
                                                 input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
                                                 head=model.base_model.lm_head,logits_processor=logits_processor,
                                                 lpfrog_layer=model.lpfrog_layer)
+    elif model.generate_type == "reeagle":
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate_reeagle(accept_hidden_state_new,
+                                                input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                                head=model.base_model.lm_head,logits_processor=logits_processor)
     else:
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
                                                 input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),

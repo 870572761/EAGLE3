@@ -82,7 +82,10 @@ class EaModel_lpf(nn.Module):
             self.lpfrog_layer.load_state_dict(lpf_layer_state_dict, strict=True)
             self.lpfrog_layer.to(self.base_model.dtype).to(device)
         #lpf
-        self.ea_layer.init_tree()
+        if self.generate_type in ["topmatch","lpfeagle","kl"]:
+            self.ea_layer.init_tree()
+        else:
+            self.ea_layer.init_tree0()
         # self.ea_layer.init_tree()#倍数变多了
 
     def get_tokenizer(self):
